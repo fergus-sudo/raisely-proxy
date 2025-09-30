@@ -88,4 +88,78 @@ app.get("/commutes", async (_req, res) => {
       if (!isLikelyCommute(a)) continue;
 
       const p = a.profile || {};
-      const
+      const pid = p.uuid || p.profileUuid;
+      if (pid) {
+        const cur = individuals.get(pid) || {
+          uuid: pid,
+          name: p.fullName || p.name || "Anonymous",
+          avatar: p.avatar?.thumb || null,
+          points: 0,
+        };
+        cur.points += 1;
+        individuals.set(pid, cur);
+      }
+
+      const t = a.team || {};
+      const tid = t.uuid || t.teamUuid;
+      if (tid) {
+        const cur = teams.get(tid) || { uuid: tid, name: t.name || "Team", points: 0 };
+        cur.points += 1;
+        teams.set(tid, cur);
+      }
+
+      const o = a.organisation || {};
+      const oid = o.uuid || o.organisationUuid;
+      if (oid) {
+        const cur = orgs.get(oid) || { uuid: oid, name: o.name || "Organisation", points: 0 };
+        cur.points += 1;
+        orgs.set(oid, cur);
+      }
+    }
+
+    const sortDesc = (a, b) => b.points - a.points;
+    res.json({
+      individuals: Array.from(individuals.values()).sort(sortDesc),
+      teams: Array.from(teams.values()).sort(sortDesc),
+      organisations: Array.from(orgs.values()).sort(sortDesc),
+    });
+  } catch (e) {
+    console.error(e);
+    res.status(500).json({ error: String(e.message || e) });
+  }
+});
+
+// --- Human-friendly diagnostic: /peek ---
+app.get("/peek", async (_req, res) => {
+  const out = {
+    env: { haveKey: !!RAISELY_API_KEY, haveCampaign: !!CAMPAIGN_UUID },
+    check: {},
+    notes: "200 means visible; 404 means not found in this workspace; 401/403 means auth/permission.",
+  };
+  try {
+    const headers = { Authorization: `Bearer ${RAISELY_API_KEY}` };
+
+    // Confirm campaign exists and is visible
+    const c1 = await fetch(`https://api.raisely.com/v3/campaigns/${encodeURIComponent(CAMPAIGN_UUID)}`, { headers });
+    out.check["GET /campaigns/{uuid}"] = c1.status;
+
+    // Probe activities via the campaigns/{uuid}/activities form
+    const a1 = await fetch(
+      `https://api.raisely.com/v3/campaigns/${encodeURIComponent(CAMPAIGN_UUID)}/activities?limit=1`,
+      { headers }
+    );
+    out.check["GET /campaigns/{uuid}/activities?limit=1"] = a1.status;
+
+    res.json(out);
+  } catch (e) {
+    out.error = String(e.message || e);
+    res.status(500).json(out);
+  }
+});
+
+// --- Root ---
+app.get("/", (_req, res) => res.send("Raisely commute proxy is running"));
+
+app.listen(PORT, () => {
+  console.log(`Proxy running on :${PORT}`);
+});

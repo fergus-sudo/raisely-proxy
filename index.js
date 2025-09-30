@@ -4,82 +4,97 @@ const fetch = require("node-fetch");
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-// 🔐 Set these on Render as environment variables
-const RAISELY_API_KEY = process.env.RAISELY_API_KEY; // e.g. raisely-sk-...
-const CAMPAIGN_UUID  = process.env.CAMPAIGN_UUID;    // e.g. 90bda370-...
+// 🔐 Read these from Render env
+const RAISELY_API_KEY = process.env.RAISELY_API_KEY;
+const CAMPAIGN_UUID  = process.env.CAMPAIGN_UUID; // set this to campaign OR campaign-profile UUID
 
-// Allow calls from your Raisely site
+// CORS for your Raisely site preview
 app.use((req, res, next) => {
   res.setHeader("Access-Control-Allow-Origin", "*");
   res.setHeader("Access-Control-Allow-Methods", "GET, OPTIONS");
-  res.setHeader("Access-Control-Allow-Headers", "Content-Type");
+  res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization");
   next();
 });
 
+// Optional: treat only these activity types as “commutes”
 const COMMUTE_ACTIVITY_TYPES = [
   "Run","Walk","Ride","E-Bike Ride","Scooter","Commute","Transit","Bus","Ferry",
 ];
-const STRAVA_COMMUTE_FLAG_KEYS = ["commute","is_commute","isCommute"];
 
-function isLikelyCommute(activity) {
-  const src = (activity.source || "").toLowerCase();
-  const fromStrava = src.includes("strava");
-  const fromManual = src.includes("manual") || src === "" || src === "web";
-
-  const type = (activity.type || "").trim();
+// Is an activity a commute?
+function isLikelyCommute(a = {}) {
+  const fromManual = (a.source || "").toLowerCase() === "manual";
+  const fromStrava = (a.source || "").toLowerCase() === "strava";
+  const type = (a.type || "").trim();
   const typeIsCommute = COMMUTE_ACTIVITY_TYPES.includes(type);
 
-  const meta = activity.meta || activity.metadata || {};
+  const meta = a.meta || a.metadata || {};
+  const STRAVA_COMMUTE_FLAG_KEYS = ["commute","is_commute","isCommute"];
   const flagged = STRAVA_COMMUTE_FLAG_KEYS.some(k => {
     const v = meta[k];
     return v === true || v === "true" || v === 1 || v === "1";
   });
 
-  if (fromManual && (typeIsCommute || !type)) return true;
+  // Manual entries with missing/odd types still count if intended
+  if (fromManual && (!type || typeIsCommute)) return true;
+  // Strava entries need either type match or commute flag
   if (fromStrava && (flagged || typeIsCommute)) return true;
+
   return false;
 }
 
-async function fetchAllActivities() {
+// ---- Fetch activities with endpoint fallback ----
+async function fetchAllActivitiesWithFallback() {
   if (!RAISELY_API_KEY) throw new Error("Missing RAISELY_API_KEY");
-  if (!CAMPAIGN_UUID) throw new Error("Missing CAMPAIGN_UUID");
-  let page = 1;
-  const limit = 100;
-  const all = [];
+  if (!CAMPAIGN_UUID)  throw new Error("Missing CAMPAIGN_UUID");
 
-  while (true) {
-    const url = `https://api.raisely.com/v3/activities?campaign=${encodeURIComponent(
-      CAMPAIGN_UUID
-    )}&status=APPROVED&private=0&page=${page}&limit=${limit}&order=desc&sort=createdAt`;
+  const headers = { Authorization: `Bearer ${RAISELY_API_KEY}` };
 
-    const res = await fetch(url, {
-      headers: { Authorization: `Bearer ${RAISELY_API_KEY}` },
-    });
-    if (!res.ok) throw new Error(`Raisely API ${res.status}`);
+  // 1) Try /campaigns/{uuid}/activities
+  let tried = [];
+  const urlA = `https://api.raisely.com/v3/campaigns/${encodeURIComponent(CAMPAIGN_UUID)}/activities?order=desc&sort=createdAt&limit=100`;
+  tried.push(urlA);
+  let res = await fetch(urlA, { headers });
+  if (res.status === 200) {
     const json = await res.json();
-    const items = json?.data || [];
-    all.push(...items);
-    if (items.length < limit) break;
-    page += 1;
-    if (page > 50) break; // safety cap
+    return { items: json?.data || [], used: urlA, status: res.status };
   }
-  return all;
+
+  // 2) Fallback to /activities?campaign={uuid}
+  const urlB = `https://api.raisely.com/v3/activities?campaign=${encodeURIComponent(CAMPAIGN_UUID)}&order=desc&sort=createdAt&limit=100`;
+  tried.push(urlB);
+  res = await fetch(urlB, { headers });
+  const fallbackJson = await (async () => { try { return await res.json(); } catch { return null; } })();
+
+  if (res.status === 200) {
+    return { items: fallbackJson?.data || [], used: urlB, status: res.status };
+  }
+
+  // Bubble up detail so you can see it in /probe
+  const detail = {
+    tried,
+    lastStatus: res.status,
+    lastBody: fallbackJson,
+  };
+  const err = new Error("Raisely API did not return 200");
+  err.detail = detail;
+  throw err;
 }
 
-// GET /commutes  ->  [{uuid,name,avatar,points}, ...] sorted desc
+// Leaderboard endpoint
 app.get("/commutes", async (req, res) => {
   try {
-    const activities = await fetchAllActivities();
+    const { items } = await fetchAllActivitiesWithFallback();
 
     const individuals = new Map();
-    const teams       = new Map();
-    const orgs        = new Map();
+    const teams = new Map();
+    const orgs = new Map();
 
-    for (const a of activities) {
+    for (const a of items) {
       if (!isLikelyCommute(a)) continue;
 
       const p = a.profile || {};
-      const pid = p.uuid || a.profileUuid;
+      const pid = p.uuid || p.profileUuid;
       if (pid) {
         const cur = individuals.get(pid) || {
           uuid: pid,
@@ -92,7 +107,7 @@ app.get("/commutes", async (req, res) => {
       }
 
       const t = a.team || {};
-      const tid = t.uuid || a.teamUuid;
+      const tid = t.uuid || t.teamUuid;
       if (tid) {
         const cur = teams.get(tid) || { uuid: tid, name: t.name || "Team", points: 0 };
         cur.points += 1;
@@ -100,7 +115,7 @@ app.get("/commutes", async (req, res) => {
       }
 
       const o = a.organisation || {};
-      const oid = o.uuid || a.organisationUuid;
+      const oid = o.uuid || o.organisationUuid;
       if (oid) {
         const cur = orgs.get(oid) || { uuid: oid, name: o.name || "Organisation", points: 0 };
         cur.points += 1;
@@ -109,7 +124,6 @@ app.get("/commutes", async (req, res) => {
     }
 
     const sortDesc = (a, b) => b.points - a.points;
-
     res.json({
       individuals: Array.from(individuals.values()).sort(sortDesc),
       teams: Array.from(teams.values()).sort(sortDesc),
@@ -117,9 +131,41 @@ app.get("/commutes", async (req, res) => {
     });
   } catch (e) {
     console.error(e);
-    res.status(500).json({ error: String(e.message || e) });
+    res.status(500).json({ error: String(e.message || e), detail: e.detail || null });
   }
 });
 
+// 🔎 Human-friendly probe (open in browser)
+app.get("/probe", async (_req, res) => {
+  try {
+    const out = await fetchAllActivitiesWithFallback();
+    res.json({
+      ok: true,
+      usedEndpoint: out.used,
+      status: out.status,
+      count: out.items.length,
+      sample: out.items.slice(0, 2),
+      env: {
+        haveKey: !!RAISELY_API_KEY,
+        haveCampaign: !!CAMPAIGN_UUID,
+      },
+    });
+  } catch (e) {
+    res.status(500).json({
+      ok: false,
+      error: e.message,
+      detail: e.detail || null,
+      env: {
+        haveKey: !!RAISELY_API_KEY,
+        haveCampaign: !!CAMPAIGN_UUID,
+      },
+    });
+  }
+});
+
+// Root
 app.get("/", (_req, res) => res.send("Raisely commute proxy is running"));
-app.listen(PORT, () => console.log(`Proxy running on :${PORT}`));
+
+app.listen(PORT, () => {
+  console.log(`Proxy running on :${PORT}`);
+});

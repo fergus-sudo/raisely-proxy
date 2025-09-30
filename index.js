@@ -4,11 +4,11 @@ const fetch = require("node-fetch");
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-// 🔐 Render env vars
+// 🔐 Read these from Render env
 const RAISELY_API_KEY = process.env.RAISELY_API_KEY;
-const CAMPAIGN_UUID   = process.env.CAMPAIGN_UUID; // can be Campaign *or* Campaign Profile UUID
+const CAMPAIGN_UUID  = process.env.CAMPAIGN_UUID; // try Campaign UUID (90bda370-...) first
 
-// CORS for Raisely component preview
+// CORS for your Raisely site preview
 app.use((req, res, next) => {
   res.setHeader("Access-Control-Allow-Origin", "*");
   res.setHeader("Access-Control-Allow-Methods", "GET, OPTIONS");
@@ -16,17 +16,15 @@ app.use((req, res, next) => {
   next();
 });
 
-// Activity types we’ll treat as commutes
+// Optional: treat only these activity types as “commutes”
 const COMMUTE_ACTIVITY_TYPES = [
   "Run","Walk","Ride","E-Bike Ride","Scooter","Commute","Transit","Bus","Ferry",
 ];
 
-// Heuristic: is an activity a commute?
+// Is an activity a commute?
 function isLikelyCommute(a = {}) {
-  const source = (a.source || "").toLowerCase();
-  const fromManual = source === "manual";
-  const fromStrava = source === "strava";
-
+  const fromManual = (a.source || "").toLowerCase() === "manual";
+  const fromStrava = (a.source || "").toLowerCase() === "strava";
   const type = (a.type || "").trim();
   const typeIsCommute = COMMUTE_ACTIVITY_TYPES.includes(type);
 
@@ -39,60 +37,61 @@ function isLikelyCommute(a = {}) {
 
   if (fromManual && (!type || typeIsCommute)) return true;
   if (fromStrava && (flagged || typeIsCommute)) return true;
-
   return false;
 }
 
-// ---- Try multiple Raisely endpoints until one returns 200 ----
+// ---- Fetch activities with endpoint fallback ----
 async function fetchAllActivitiesWithFallback() {
   if (!RAISELY_API_KEY) throw new Error("Missing RAISELY_API_KEY");
   if (!CAMPAIGN_UUID)  throw new Error("Missing CAMPAIGN_UUID");
 
   const headers = { Authorization: `Bearer ${RAISELY_API_KEY}` };
-
-  // We’ll try all reasonable permutations
-  const qs = "order=desc&sort=createdAt&limit=100";
-
-  const candidates = [
-    // Campaign UUID path + query param versions
-    `https://api.raisely.com/v3/campaigns/${encodeURIComponent(CAMPAIGN_UUID)}/activities?${qs}`,
-    `https://api.raisely.com/v3/activities?campaign=${encodeURIComponent(CAMPAIGN_UUID)}&${qs}`,
-
-    // Campaign Profile UUID path + query param versions
-    `https://api.raisely.com/v3/campaign-profiles/${encodeURIComponent(CAMPAIGN_UUID)}/activities?${qs}`,
-    `https://api.raisely.com/v3/activities?campaignProfile=${encodeURIComponent(CAMPAIGN_UUID)}&${qs}`,
-  ];
-
   const tried = [];
-  for (const url of candidates) {
-    tried.push(url);
-    const res = await fetch(url, { headers });
-    let body = null;
-    try { body = await res.json(); } catch (_) {}
 
-    if (res.status === 200) {
-      return {
-        items: body?.data || [],
-        used: url,
-        status: res.status,
-        tried,
-      };
-    }
+  // 1) /campaigns/{uuid}/activities
+  const urlA = `https://api.raisely.com/v3/campaigns/${encodeURIComponent(CAMPAIGN_UUID)}/activities?order=desc&sort=createdAt&limit=100`;
+  tried.push(urlA);
+  let res = await fetch(urlA, { headers });
+  if (res.status === 200) {
+    const json = await res.json().catch(() => null);
+    return { items: json?.data || [], used: urlA, status: res.status };
+  }
 
-    // 401/403/404 etc — move on to next candidate
-    // But if it’s a hard auth error, you’ll see it in /probe detail
-    if (res.status >= 500) {
-      // transient errors: keep trying next, but include in detail
-    }
+  // 2) /activities?campaign={uuid}
+  const urlB = `https://api.raisely.com/v3/activities?campaign=${encodeURIComponent(CAMPAIGN_UUID)}&order=desc&sort=createdAt&limit=100`;
+  tried.push(urlB);
+  res = await fetch(urlB, { headers });
+  if (res.status === 200) {
+    const json = await res.json().catch(() => null);
+    return { items: json?.data || [], used: urlB, status: res.status };
+  }
+
+  // 3) /campaign-profiles/{uuid}/activities
+  const urlC = `https://api.raisely.com/v3/campaign-profiles/${encodeURIComponent(CAMPAIGN_UUID)}/activities?order=desc&sort=createdAt&limit=100`;
+  tried.push(urlC);
+  res = await fetch(urlC, { headers });
+  if (res.status === 200) {
+    const json = await res.json().catch(() => null);
+    return { items: json?.data || [], used: urlC, status: res.status };
+  }
+
+  // 4) /activities?campaignProfile={uuid}
+  const urlD = `https://api.raisely.com/v3/activities?campaignProfile=${encodeURIComponent(CAMPAIGN_UUID)}&order=desc&sort=createdAt&limit=100`;
+  tried.push(urlD);
+  res = await fetch(urlD, { headers });
+  const lastBody = await res.json().catch(() => null);
+
+  if (res.status === 200) {
+    return { items: lastBody?.data || [], used: urlD, status: res.status };
   }
 
   const err = new Error("Raisely API did not return 200");
-  err.detail = { tried, lastStatus: 404, lastBody: null };
+  err.detail = { tried, lastStatus: res.status, lastBody };
   throw err;
 }
 
 // Leaderboard endpoint
-app.get("/commutes", async (_req, res) => {
+app.get("/commutes", async (req, res) => {
   try {
     const { items } = await fetchAllActivitiesWithFallback();
 
@@ -145,7 +144,7 @@ app.get("/commutes", async (_req, res) => {
   }
 });
 
-// 🔎 Human-friendly probe
+// 🔎 Probe (what we already used)
 app.get("/probe", async (_req, res) => {
   try {
     const out = await fetchAllActivitiesWithFallback();
@@ -154,26 +153,45 @@ app.get("/probe", async (_req, res) => {
       usedEndpoint: out.used,
       status: out.status,
       count: out.items.length,
-      tried: out.tried,
-      env: {
-        haveKey: !!RAISELY_API_KEY,
-        haveCampaign: !!CAMPAIGN_UUID,
-      },
+      sample: out.items.slice(0, 2),
+      env: { haveKey: !!RAISELY_API_KEY, haveCampaign: !!CAMPAIGN_UUID },
     });
   } catch (e) {
     res.status(500).json({
       ok: false,
       error: e.message,
       detail: e.detail || null,
-      env: {
-        haveKey: !!RAISELY_API_KEY,
-        haveCampaign: !!CAMPAIGN_UUID,
-      },
+      env: { haveKey: !!RAISELY_API_KEY, haveCampaign: !!CAMPAIGN_UUID },
     });
+  }
+});
+
+// 👀 NEW: simple ID/key sanity checks
+app.get("/peek", async (_req, res) => {
+  const headers = { Authorization: `Bearer ${RAISELY_API_KEY}` };
+  const j = async (r) => ({ status: r.status, body: await r.json().catch(() => null) });
+
+  try {
+    const [campaign, profile, anyActivities] = await Promise.all([
+      fetch(`https://api.raisely.com/v3/campaigns/${encodeURIComponent(CAMPAIGN_UUID)}`, { headers }).then(j),
+      fetch(`https://api.raisely.com/v3/campaign-profiles/${encodeURIComponent(CAMPAIGN_UUID)}`, { headers }).then(j),
+      fetch(`https://api.raisely.com/v3/activities?limit=1`, { headers }).then(j),
+    ]);
+
+    res.json({
+      env: { haveKey: !!RAISELY_API_KEY, haveCampaign: !!CAMPAIGN_UUID },
+      check: {
+        "GET /campaigns/{uuid}": campaign.status,
+        "GET /campaign-profiles/{uuid}": profile.status,
+        "GET /activities?limit=1": anyActivities.status,
+      },
+      notes: "200 means visible; 404 means not found in this workspace; 401/403 means auth/permission.",
+    });
+  } catch (e) {
+    res.status(500).json({ ok: false, error: String(e) });
   }
 });
 
 // Root
 app.get("/", (_req, res) => res.send("Raisely commute proxy is running"));
-
 app.listen(PORT, () => console.log(`Proxy running on :${PORT}`));

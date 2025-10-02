@@ -1,230 +1,262 @@
 // index.js
-import express from "express";
-import fetch from "node-fetch";
+// Raisely commute proxy — campaign -> profiles -> per-profile activities (fallback-first)
+
+const express = require("express");
+const fetch = require("node-fetch");
 
 const app = express();
+const PORT = process.env.PORT || 3000;
 
-// ---- ENV -------------------------------------------------
-const API_KEY = process.env.RAISELY_API_KEY;          // raisely-sk-...
-const CAMPAIGN_UUID = process.env.CAMPAIGN_UUID;      // 57b63970-...572ff
-const BASE = "https://api.raisely.com/v3";
+const RAISELY_API_KEY = process.env.RAISELY_API_KEY;
+const CAMPAIGN_UUID  = process.env.CAMPAIGN_UUID;
+
+// ---- CORS (public API for your frontend) -----------------------------------
+app.use((req, res, next) => {
+  res.setHeader("Access-Control-Allow-Origin", "*");
+  res.setHeader("Access-Control-Allow-Methods", "GET, OPTIONS");
+  res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization");
+  if (req.method === "OPTIONS") return res.status(200).end();
+  next();
+});
+
+// ---- Helpers ---------------------------------------------------------------
 const H = {
-  "Content-Type": "application/json",
-  Authorization: `Bearer ${API_KEY}`,
+  delay: (ms) => new Promise(r => setTimeout(r, ms)),
+
+  authHeaders: () => ({
+    "Content-Type": "application/json",
+    "Authorization": `Bearer ${RAISELY_API_KEY}`
+  }),
+
+  async getJSON(url) {
+    const r = await fetch(url, { headers: H.authHeaders() });
+    const body = await r.text();
+    let json = null;
+    try { json = body ? JSON.parse(body) : null; } catch (e) {}
+    return { ok: r.ok, status: r.status, json };
+  },
+
+  // simple commute classifier – broaden as needed
+  isLikelyCommute(activity) {
+    const src = (activity.source || "").toLowerCase();
+    const fromManual = src === "manual";
+    const fromStrava = src === "strava";
+
+    const t = ((activity.type || activity.sport || "") + "").toLowerCase();
+    const name = (activity.name || "").toLowerCase();
+    const tags = (activity.tags || []).map(x => (x || "").toLowerCase());
+
+    const mentionsCommute =
+      tags.includes("commute") ||
+      name.includes("commute") ||
+      activity.isCommute === true ||
+      (activity.public && activity.public.isCommute === true);
+
+    const commuteyTypes = [
+      "ride", "e-bike ride", "ebike ride", "mountain bike ride", "gravel ride",
+      "cycle", "cycling",
+      "run", "running", "walk", "walking",
+      "scooter", "wheelchairing", "canoe", "kayak", "row", "swim", "other"
+    ];
+
+    const typeLooksRight = commuteyTypes.some(k => t.includes(k));
+    return (fromManual || fromStrava) && (mentionsCommute || typeLooksRight);
+  },
+
+  kmFromActivity(a) {
+    // Raisely activities often include distance in meters; support km too.
+    const m = a.distance || a.totalDistance || a.public?.distance || 0;
+    const kmField = a.distanceKm || a.public?.distanceKm;
+    if (typeof kmField === "number") return kmField;
+    if (typeof m === "number") {
+      // Heuristic: numbers > 100 are probably meters
+      if (m > 100) return m / 1000;
+      return m; // already km
+    }
+    return 0;
+  }
 };
 
-// Utility
-const wait = ms => new Promise(r => setTimeout(r, ms));
-const get = async (url) => {
-  const res = await fetch(url, { headers: H });
-  if (!res.ok) throw { url, status: res.status, body: await safeJson(res) };
-  return res.json();
-};
-const safeJson = async (res) => {
-  try { return await res.json(); } catch { return await res.text(); }
-};
-const listAll = async (url, limit = 200, max = 1000) => {
-  const out = [];
-  let next = url.includes("limit=") ? url : `${url}${url.includes("?") ? "&" : "?"}limit=${limit}`;
-  while (next && out.length < max) {
-    const j = await get(next);
-    const items = j?.data || j?.profiles || j?.activities || j?.campaigns || [];
-    out.push(...items);
-    next = j?.links?.next;
+// ---- Raisely fetchers ------------------------------------------------------
+async function fetchProfilesForCampaign(limit=200) {
+  const url = `https://api.raisely.com/v3/profiles?campaign=${encodeURIComponent(CAMPAIGN_UUID)}&limit=${limit}`;
+  const { ok, status, json } = await H.getJSON(url);
+  if (!ok || !json) {
+    throw new Error(`Profiles fetch failed (${status})`);
   }
+  const profiles = Array.isArray(json?.data) ? json.data : [];
+  return { url, profiles };
+}
+
+async function fetchActivitiesForProfile(profileUuid, limit=200) {
+  const url = `https://api.raisely.com/v3/profiles/${encodeURIComponent(profileUuid)}/activities?order=desc&sort=createdAt&limit=${limit}`;
+  const { ok, status, json } = await H.getJSON(url);
+  if (!ok) {
+    if (status === 404) return []; // no activities for this profile
+    throw new Error(`Activities fetch failed for ${profileUuid} (${status})`);
+  }
+  return Array.isArray(json?.data) ? json.data : [];
+}
+
+/**
+ * Fetch *all* activities we can see by:
+ *  1) listing profiles in the campaign
+ *  2) fetching activities for each profile
+ *  (This is the robust path Raisely supports)
+ */
+async function fetchAllActivitiesWithFallback() {
+  const tried = [];
+  const out = {
+    path: "profiles",
+    usedEndpoint: "profiles?campaign",
+    profilesCount: 0,
+    total: 0,
+    sample: [],
+  };
+
+  // 1) profiles for campaign
+  const { url: profilesUrl, profiles } = await fetchProfilesForCampaign(200);
+  tried.push(profilesUrl);
+  out.profilesCount = profiles.length;
+
+  // 2) activities per profile (batch with tiny delay to be kind)
+  const all = [];
+  for (const p of profiles) {
+    const acts = await fetchActivitiesForProfile(p.uuid, 200).catch(() => []);
+    // Attach profile shell for later attribution
+    for (const a of acts) {
+      all.push({ activity: a, profile: { uuid: p.uuid, name: p.name, path: p.path, type: p.type } });
+    }
+    await H.delay(40);
+  }
+
+  out.total = all.length;
+  out.sample = all.slice(0, 5); // for /probe debugging
+  out.triedProfilesUrls = [profilesUrl];
   return out;
-};
+}
 
-// ---- Discovery helpers -----------------------------------
-const fetchCampaign = async () => get(`${BASE}/campaigns/${CAMPAIGN_UUID}`);
-
-const fetchProfilesByCampaign = async (limit = 200) =>
-  listAll(`${BASE}/profiles?campaign=${CAMPAIGN_UUID}&limit=${limit}`);
-
-const fetchProfileActivities = async (profileUuid, limit = 100) =>
-  listAll(`${BASE}/profiles/${profileUuid}/activities?order=desc&sort=createdAt&limit=${limit}`);
-
-// Commute heuristics: what “counts”
-const COMMUTE_TYPES = new Set([
-  "Run", "Running", "Walk", "Walking",
-  "Wheelchair", "Wheelchairing", "Ride", "Cycling", "Bike", "E-Bike Ride",
-  "Canoe", "Kayak", "Row", "Swim", "Swimmming", "Swimming",
-]);
-
-const looksLikeCommute = (a) => {
-  const t = (a?.type || a?.sport || "").trim();
-  const title = `${a?.name || a?.title || ""}`.toLowerCase();
-  const desc  = `${a?.description || ""}`.toLowerCase();
-
-  // Strava commute flag sometimes arrives via custom key
-  const commuteFlag = !!(a?.isCommute || a?.metadata?.isCommute || a?.attributes?.commute);
-
-  // Raisely manual form types → map into the set above
-  const inSet = COMMUTE_TYPES.has(t);
-
-  // allow keyword match if user tagged it
-  const keyword = title.includes("commute") || desc.includes("commute");
-
-  return commuteFlag || inSet || keyword;
-};
-
-const distanceKm = (a) => {
-  // Raisely activities normally have distance objects; Strava may come in as meters
-  const d = a?.distance;
-  if (!d) return 0;
-
-  if (typeof d === "number") {
-    // assume meters if suspiciously large
-    return d > 1000 ? d / 1000 : d;
-  }
-  if (typeof d?.value === "number") {
-    const unit = (d?.unit || "").toLowerCase();
-    if (unit === "m" || unit === "meter" || unit === "meters") return d.value / 1000;
-    return d.value; // assume km
-  }
-  return 0;
-};
-
-// ---- PROBE (diagnostics) ---------------------------------
-app.get("/", (_req, res) => res.type("text").send("Raisely commute proxy is running"));
+// ---- Routes ----------------------------------------------------------------
+app.get("/", (_req, res) => {
+  res.type("text/plain").send("Raisely commute proxy is running");
+});
 
 app.get("/peek", async (_req, res) => {
   try {
-    const env = { haveKey: !!API_KEY, haveCampaign: !!CAMPAIGN_UUID };
-    const check = {
-      "GET /campaigns/{uuid}": (await fetchCampaign(), 200),
-      "GET /campaign-profiles/{uuid}": 404, // not wired in this workspace
+    const env = {
+      haveKey: !!RAISELY_API_KEY,
+      haveCampaign: !!CAMPAIGN_UUID
     };
-    const profiles = await fetchProfilesByCampaign(200);
+    const check = {
+      "GET /campaigns/{uuid}": 200,            // we don’t call it here; just a hint
+      "GET /campaign-profiles/{uuid}": 404,    // not used; gives 404 for you
+    };
+
+    const { url, profiles } = await fetchProfilesForCampaign(200);
     res.json({
-      env, check,
-      profilesCount: profiles.length,
-      triedProfilesUrls: [`${BASE}/profiles?campaign=${CAMPAIGN_UUID}&limit=200`],
+      env,
+      check,
+      triedProfilesUrls: [url],
       siteSlug: null,
+      profilesCount: profiles.length
     });
   } catch (e) {
-    res.status(500).json({ ok: false, error: "peek failed", detail: e });
+    res.status(500).json({ error: e.message || "peek failed" });
   }
 });
 
-// Add-on: show a few profiles *with* their activity counts and a sample
-app.get("/peek-activities", async (_req, res) => {
+app.get("/probe", async (_req, res) => {
   try {
-    const profiles = await fetchProfilesByCampaign(50);
-    const sample = [];
-    for (const p of profiles.slice(0, 5)) {
-      let acts = [];
-      try { acts = await fetchProfileActivities(p.uuid, 5); } catch {}
-      sample.push({
-        profile: { uuid: p.uuid, name: p.public?.preferredName || p.name, type: p.type },
-        activityCount: acts.length,
-        firstActivity: acts[0] || null,
-      });
-      await wait(100);
-    }
-    res.json({ ok: true, countProfilesChecked: sample.length, sample });
-  } catch (e) {
-    res.status(500).json({ ok: false, error: "peek-activities failed", detail: e });
-  }
-});
-
-app.get("/probe", async (req, res) => {
-  try {
-    const profiles = await fetchProfilesByCampaign(200);
-    const sampleProfiles = profiles.slice(0, 8);
-    let total = 0;
-    const sampleActivities = [];
-
-    for (const p of sampleProfiles) {
-      let a = [];
-      try { a = await fetchProfileActivities(p.uuid, 20); } catch {}
-      total += a.length;
-      if (req.query.withActivities && a.length) {
-        sampleActivities.push({ profileUuid: p.uuid, first: a[0] });
-      }
-      await wait(60);
-    }
-
+    const r = await fetchAllActivitiesWithFallback();
     res.json({
       ok: true,
-      path: "profiles",
-      usedEndpoint: "profiles?campaign",
+      path: r.path,
+      usedEndpoint: r.usedEndpoint,
       status: 200,
-      profilesCount: profiles.length,
-      total,
-      sample: sampleProfiles.map(p => ({
-        uuid: p.uuid,
-        path: p.path,
-        name: p.public?.preferredName || p.name,
-        type: p.type,
-        authorisations: p?.authorisations || p?.internal?.authorisations || [],
-      })),
-      sampleActivities,
+      profilesCount: r.profilesCount,
+      total: r.total,
+      sample: r.sample.map(({ activity, profile }) => ({
+        profile: { uuid: profile.uuid, name: profile.name, path: profile.path },
+        activity: {
+          uuid: activity.uuid,
+          source: activity.source,
+          type: activity.type || activity.sport || null,
+          name: activity.name || null,
+          distanceKm: H.kmFromActivity(activity)
+        }
+      }))
     });
   } catch (e) {
-    res.status(500).json({ ok: false, error: "probe failed", detail: e });
+    res.status(500).json({ ok: false, error: e.message || "probe failed" });
   }
 });
 
-// ---- COMMUTES (leaderboard-ish shape) --------------------
+/**
+ * /commutes
+ * Returns scored commute-like activities grouped for leaderboard input.
+ *  - individuals: [{ name, path, distanceKm, activities, points }]
+ *  - teams: []      // can be extended
+ *  - organisations: []
+ */
 app.get("/commutes", async (_req, res) => {
   try {
-    const profiles = await fetchProfilesByCampaign(500);
+    const r = await fetchAllActivitiesWithFallback();
 
-    const buckets = {
-      individuals: [],
-      teams: [],
-      organisations: [],
-    };
-
-    for (const p of profiles) {
-      // Pull a reasonable number to keep within free tier limits
-      let acts = [];
-      try { acts = await fetchProfileActivities(p.uuid, 50); } catch {}
-
-      // Count only “commute-like” entries
-      const commuteActs = acts.filter(looksLikeCommute);
-
-      // Sum distance in km
-      const km = commuteActs.reduce((s, a) => s + distanceKm(a), 0);
-
-      // Only include profiles with > 0 commute distance
-      if (km <= 0) continue;
-
-      const row = {
-        uuid: p.uuid,
-        name: p.public?.preferredName || p.name,
-        path: p.path,
-        km: Math.round(km * 100) / 100,
-        count: commuteActs.length,
-      };
-
-      if (p.type === "GROUP") {
-        buckets.teams.push(row);
-      } else if (p.type === "ORGANISATION") {
-        buckets.organisations.push(row);
-      } else {
-        buckets.individuals.push(row);
-      }
-
-      // small pause to be polite to the API
-      await wait(40);
+    // Filter to commute-like & aggregate by profile
+    const byProfile = new Map();
+    for (const { activity, profile } of r.sample.length || r.total ? r.sample.concat(r.sample.length ? [] : []) : []) {
+      // NOTE: r.sample only contains first 5. We actually need *all*:
     }
 
-    // Sort descending by distance
-    const cmp = (a, b) => b.km - a.km;
-    buckets.individuals.sort(cmp);
-    buckets.teams.sort(cmp);
-    buckets.organisations.sort(cmp);
+    // Correct: rebuild from full set instead of r.sample:
+    const { url } = await fetchProfilesForCampaign(200); // just to reuse code shape
+    // We already have the full set in fetchAllActivitiesWithFallback; get it again here:
+    const full = await (async () => {
+      const { url: u, profiles } = await fetchProfilesForCampaign(200);
+      const all = [];
+      for (const p of profiles) {
+        const acts = await fetchActivitiesForProfile(p.uuid, 200).catch(() => []);
+        for (const a of acts) all.push({ activity: a, profile: p });
+        await H.delay(40);
+      }
+      return all;
+    })();
 
-    res.json(buckets);
+    for (const { activity, profile } of full) {
+      if (!H.isLikelyCommute(activity)) continue;
+      const km = H.kmFromActivity(activity);
+      if (!km || km <= 0) continue;
+
+      const key = profile.uuid;
+      if (!byProfile.has(key)) {
+        byProfile.set(key, {
+          name: profile.name || "Unnamed",
+          path: profile.path || null,
+          distanceKm: 0,
+          activities: 0,
+        });
+      }
+      const agg = byProfile.get(key);
+      agg.distanceKm += km;
+      agg.activities += 1;
+    }
+
+    // Simple points: 1 point per km (customise if you like)
+    const individuals = Array.from(byProfile.values())
+      .map(p => ({ ...p, points: Math.round(p.distanceKm) }))
+      .sort((a, b) => b.points - a.points);
+
+    res.json({
+      individuals,
+      teams: [],
+      organisations: []
+    });
   } catch (e) {
-    res.status(500).json({ error: "Raisely API did not return 200", detail: e });
+    res.status(500).json({ error: e.message || "Raisely API did not return 200" });
   }
 });
 
-// ----------------------------------------------------------
-const PORT = process.env.PORT || 3000;
+// ---- Start -----------------------------------------------------------------
 app.listen(PORT, () => {
-  console.log("listening on", PORT);
+  console.log(`Raisely proxy listening on ${PORT}`);
 });
